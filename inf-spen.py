@@ -14,7 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as func
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 with open('data/bibtex/train.pickle', "rb") as f:
@@ -40,19 +40,25 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.layer1 = nn.Linear(1836, 150)
         self.layer2 = nn.Linear(150, 150)
-        self.out_l = nn.Linear(150, 159)
+        self.out_l = nn.Linear(150, 159, bias=False)
 
-    def forward(self, x, only_feature_extraction=False):
+    def forward(self, x, only_feature_extraction=False, pretrain=True):
         out = func.relu(self.layer1(x))
         out = func.relu(self.layer2(out))
         if not only_feature_extraction:
             out = self.out_l(out)
+            if pretrain:
+                # from the Tensorflow implementation
+                out = -out
             out = torch.sigmoid(out)
         return out
 
 
-def f1_map(y, pred):
-    threshold = [0.05, 0.10, 0.15, 0.2, 0.25, 0.30, 0.35, 0.4, 0.45, 0.5, 0.55, 0.60, 0.65, 0.70, 0.75]
+def f1_map(y, pred, threshold=None):
+    if threshold is None:
+        threshold = [0.05, 0.10, 0.15, 0.2, 0.25, 0.30, 0.35, 0.4, 0.45, 0.5, 0.55, 0.60, 0.65, 0.70, 0.75]
+    else:
+        threshold = [0.5]
     best_f1 = 0
     for t in threshold:
         local_pred = pred > t
@@ -74,7 +80,7 @@ class EnergyNetwork(nn.Module):
         self.non_linearity = non_linearity
 
         # equation 1 in inf spen paper
-        self.B = torch.nn.Parameter(torch.transpose(-weights_last_layer_mlp, 0, 1))
+        self.B = torch.nn.Parameter(torch.transpose(weights_last_layer_mlp, 0, 1))
 
         # Label energy terms, C1/c2  in equation 5 of SPEN paper
         # in equation 2 of inf spen paper
@@ -107,56 +113,70 @@ class SPEN:
         self.feature_extractor = feature_net
         self.feature_extractor.eval()
         self.energy_func = energy_func
-        self.inf_net = inference_net
+        self.cost_inf_net = inference_net
         self.args = params
+        self.inf_net = None
+
+        # keep the phi0
+        self.phi0 = MLP().to(device)
+        self.phi0.load_state_dict(feature_net.state_dict())
 
     def _compute_energy(self, inputs, targets):
+        # feature F(x) in equation 1
         f_x = self.feature_extractor(inputs, only_feature_extraction=True)
 
-        # Energy ground truth
+        # Energy ground truth, E(x, y)
         gt_energy = self.energy_func(f_x, targets)
 
         # Cost-augmented inference network
-        pred_labels = self.inf_net(inputs)
-        pred_energy = self.energy_func(f_x, pred_labels)
-        return pred_labels, pred_energy, gt_energy
+        # E(x, phi(x))  second term of Eq.7
+        pred_probs = self.cost_inf_net(inputs, pretrain=False)
+        pred_energy = self.energy_func(f_x, pred_probs)
+        return pred_probs, pred_energy, gt_energy
 
     def compute_loss(self, inputs, targets):
 
-        pred_labels, pred_energy, gt_energy = self._compute_energy(inputs, targets)
+        pred_probs, pred_energy, gt_energy = self._compute_energy(inputs, targets)
         # Max-margin Loss
-        pre_loss = torch.sum((pred_labels - targets)**2, dim=1) - pred_energy + gt_energy
+        # Eq (7)
+        delta = torch.sum((pred_probs - targets)**2, dim=1)
+        pre_loss = delta - pred_energy + gt_energy
         eneryg_loss = torch.max(pre_loss, torch.zeros_like(pre_loss))
         eneryg_loss = torch.mean(eneryg_loss)
 
-        pred_y = pred_labels
+        entropy_loss = - nn.BCELoss()(pred_probs, pred_probs.detach())
 
-        entropy_loss = - torch.mean(pred_y * torch.log(pred_y) + (1 - pred_y) * torch.log(1 - pred_y))
+        # Eq 12 (before related work, no loss_CE)
+        inf_net_loss = eneryg_loss \
+                       - self.args.lamb_phi * sum(p.pow(2.0).sum() for p in self.cost_inf_net.parameters()) \
+                       - self.args.lamb_pre_bias * sum((x - y).pow(2.0).sum() for x, y in zip(self.cost_inf_net.state_dict().values(), self.feature_extractor.state_dict().values())) \
+                       + self.args.lamb_entropy * entropy_loss
+        inf_net_loss = -inf_net_loss
 
-        inf_net_loss = -eneryg_loss + self.args.lamb_phi * sum(p.pow(2.0).sum() for p in self.inf_net.parameters()) \
-            + self.args.lamb_pre_bias * sum((x - y).pow(2.0).sum() for x, y in zip(self.inf_net.state_dict().values(), self.feature_extractor.state_dict().values())) \
-            + self.args.lamb_entropy * entropy_loss
+        # Eq 9
         e_net_loss = eneryg_loss + self.args.lamb_theta * sum(p.pow(2.0).sum() for p in self.energy_func.parameters())
-        return pred_labels, e_net_loss, inf_net_loss
+        return pred_probs, e_net_loss, inf_net_loss
 
     def pred(self, x):
         with torch.no_grad():
-            y_pred = self.inf_net(x)
+            y_pred = self.cost_inf_net(x, pretrain=False)
         return y_pred
 
     def inference(self, x, n_steps=1):
-
-        sd = self.inf_net.state_dict()
-        inf_net2 = MLP()
+        # not
+        if self.inf_net is None:
+            sd = self.cost_inf_net.state_dict()
+        else:
+            sd = self.inf_net.state_dict()
+        inf_net2 = MLP().to(device)
         inf_net2.load_state_dict(sd)
-        self.inf_net.eval()
-        optimizer = optim.Adam(self.inf_net.parameters(), lr=args.lr_psi, weight_decay=0)
-        with torch.no_grad():
-            y_pred = self.inf_net(x)
-
-        self.inf_net.train()
-
-        return y_pred
+        optimizer = optim.Adam(self.cost_inf_net.parameters(), lr=args.lr_psi, weight_decay=0)
+        for i in range(n_steps):
+            optimizer.zero_grad()
+            _, _, inf_loss = spen.compute_loss(data, label)
+            inf_loss.backward()
+            optimizer.step()
+        self.inf_net = inf_net2
 
 
 if __name__ == '__main__':
@@ -164,12 +184,13 @@ if __name__ == '__main__':
     args.lamb_phi = 0.001
     args.lamb_entropy = 1
     args.lamb_pre_bias = 1
-    args.lamb_theta = 0.01
+    args.lamb_theta = 0.001
     args.lr_theta = 0.001
     args.lr_phi = 0.001
+    batch_size = 32
 
     # Stage 1
-    # pre-training feature net
+    # pre-training feature net or load pretrained
     dataset = 'bibtex'
     base_model = MLP().to(device)
     if not os.path.isfile('../%s_base.pt' % dataset):
@@ -194,8 +215,7 @@ if __name__ == '__main__':
             print('Epoch', epoch)
             print('Training Speed: %d examples/sec' % int(4880 / (end_time - start_time)))
             with torch.no_grad():
-                logits = base_model(test_x)
-                pred_test = torch.sigmoid(logits)
+                pred_test = base_model(test_x)
 
             f1, mAP = f1_map(test_y, pred_test)
             print(f1, mAP)
@@ -205,8 +225,7 @@ if __name__ == '__main__':
         base_model.load_state_dict(torch.load('../%s_base.pt' % dataset))
 
     with torch.no_grad():
-        logits = base_model(test_x)
-        pred_test = torch.sigmoid(logits)
+        pred_test = base_model(test_x)
 
     f1, mAP = f1_map(test_y, pred_test)
     print(f1, mAP)
@@ -223,8 +242,8 @@ if __name__ == '__main__':
 
     for epoch in range(100):
         inds = np.random.permutation(list(range(len(data_x))))
-        for i in range(0, 4880, 80):
-            idx = inds[i:i + 80]
+        for i in range(0, 4880, batch_size):
+            idx = inds[i:i + batch_size]
             data = data_x[idx]
             label = data_y[idx]
 
@@ -239,7 +258,8 @@ if __name__ == '__main__':
 
             e_loss.backward()
             optim_energy.step()
-        print(epoch)
+            # print(inf_loss.item(), e_loss.item())
+        print('Epoch', epoch)
 
         pred_test = spen.pred(test_x)
         f1, mAP = f1_map(test_y, pred_test)
@@ -249,3 +269,13 @@ if __name__ == '__main__':
         # best_f1, mAP = f1_map(test_y, pred_test)
         # print(best_f1, mAP)
         print()
+
+    # Stage 3 update inference net
+    for i in range(0, len(), batch_size):
+        idx = inds[i:i + batch_size]
+        data = data_x[idx]
+        spen.inference(data, 2)
+
+    pred_test = spen.pred(test_x)
+    f1, mAP = f1_map(test_y, pred_test)
+    print(f1, mAP)

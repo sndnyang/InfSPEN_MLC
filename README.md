@@ -15,6 +15,19 @@ python 3.6
 
 pip install -r requirements.txt
 
+## usage
+Currently just bibtex    /shared/xyang/bibtex  on vector2
+
+all hyper-parameters are written in code
+
+Original one:
+
+python inf-spe.py
+
+Joint Inf SPEN:
+
+python jispen.py
+
 
 ## Tips
 

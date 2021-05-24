@@ -236,11 +236,11 @@ for epoch in range(epochs):
             optim_inf.step()
 
         optim_energy.zero_grad()
-        preds, _, e_loss, inf_loss = spen.forward(data, label)
+        preds, _, e_loss, _ = spen.forward(data, label)
 
         e_loss.backward()
         optim_energy.step()
-    print(epoch)
+    print('Epoch {} Inf loss: {:.4f}, theta loss: {:.4f}'.format(epoch, inf_loss, e_loss))
 
     # sch_inf.step()
     # sch_energy.step()
@@ -255,6 +255,7 @@ for epoch in range(epochs):
     print(best_f1, map)
     base_f1.append(best_f1)
     base_mAP.append(mAP)
+    print()
 
 plt.plot(np.arange(epochs + 1), f1s, label='inf net')
 plt.plot(np.arange(epochs + 1), base_f1, label='feature net')

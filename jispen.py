@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as func
 import matplotlib.pyplot as plt
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 with open('data/bibtex/train.pickle', "rb") as f:
     temp = pickle.load(f)
     data_x = np.array([instance['feats'] for instance in temp])
@@ -99,12 +99,14 @@ class SPEN:
     def __init__(self, feature_net, energy_net, inf_net, label_dim=159, args=None):
         super().__init__()
         self.feature_extractor = feature_net
-        self.feature_extractor.eval()
+        # self.feature_extractor.eval()
         self.energy_net = energy_net
         self.inf_net = inf_net
         self.hidden_size = 150
 
-        self.cost_infnet = nn.Sequential(nn.Linear(2 * label_dim, label_dim), nn.Softmax(dim=1)).to(device)
+        # output should be probability vector.
+        # for MLC, use Sigmoid
+        self.cost_infnet = nn.Sequential(nn.Linear(2 * label_dim, label_dim), nn.Sigmoid()).to(device)
         # self.local2label = nn.Linear(self.hidden_size, self.num_tags)
         # self.inf2label = nn.Linear(self.hidden_size, self.num_tags)
 
@@ -127,7 +129,7 @@ class SPEN:
     def forward(self, inputs, targets):
         inf_labels, inf_energy, cost_inf_y, cost_inf_energy, gt_energy = self._compute_energy(inputs, targets)
 
-        delta = torch.sum( (cost_inf_y - targets)**2, dim=1)
+        delta = torch.sum((cost_inf_y - targets)**2, dim=1)
 
         local_ce = nn.BCELoss()(inf_labels, targets)
 
@@ -141,7 +143,7 @@ class SPEN:
         energy_loss = cost_loss_1 + cost_loss_2
 
         # loss for inf and cost inf
-        inf_loss = torch.mean(-delta + inf_energy + cost_inf_energy)  # + 0.1 * local_ce
+        inf_loss = torch.mean(-delta + inf_energy + cost_inf_energy) + 0.2 * local_ce
         return inf_labels, cost_inf_y, energy_loss, inf_loss
 
     def pred(self, x):
@@ -183,18 +185,20 @@ if not os.path.isfile('../%s_basej.pt' % dataset):
         print(f1, mAP)
         print()
     torch.save(base_model.state_dict(), '../%s_basej.pt' % dataset)
-else:
-    base_model.load_state_dict(torch.load('../%s_basej.pt' % dataset))
+# else:
+#     base_model.load_state_dict(torch.load('../%s_basej.pt' % dataset))
 
 with torch.no_grad():
     pred_test = base_model(test_x)
 
 f1, mAP = f1_map(test_y, pred_test)
 print("current base model", f1, mAP)
+base_f1 = [f1]
+base_mAP = [mAP]
 
 # Stage 2, train the inference net
 inf_net = MLP().to(device)
-inf_net.load_state_dict(base_model.state_dict())
+# inf_net.load_state_dict(base_model.state_dict())
 
 with torch.no_grad():
     pred_test = inf_net(test_x)
@@ -209,12 +213,15 @@ energy_net = EnergyNetwork(base_model.out_l.weight).to(device)
 
 spen = SPEN(base_model, energy_net, inf_net,)
 
-optim_inf = torch.optim.Adam(list(inf_net.parameters()) + list(spen.cost_infnet.parameters()), lr=1e-3, weight_decay=0)
-optim_energy = torch.optim.Adam(energy_net.parameters(), lr=1e-3, weight_decay=0)
+optim_inf = torch.optim.Adam(list(inf_net.parameters()) + list(spen.cost_infnet.parameters()), lr=0.001, weight_decay=0)
+optim_energy = torch.optim.Adam(list(energy_net.parameters()) + list(base_model.parameters()), lr=1e-3, weight_decay=0)
 
-K = 5
-print("K", K)
 epochs = 100
+sch_inf = torch.optim.lr_scheduler.CosineAnnealingLR(optim_inf, epochs)
+sch_energy = torch.optim.lr_scheduler.CosineAnnealingLR(optim_energy, epochs)
+
+K = 1
+print("K", K)
 for epoch in range(epochs):
     inds = np.random.permutation(list(range(len(data_x))))
     for i in range(0, 4880, 32):
@@ -235,16 +242,25 @@ for epoch in range(epochs):
         optim_energy.step()
     print(epoch)
 
+    # sch_inf.step()
+    # sch_energy.step()
     pred_test = spen.pred(test_x)
     best_f1, mAP = f1_map(test_y, pred_test)
     print(best_f1, mAP)
     f1s.append(best_f1)
     maps.append(mAP)
 
+    pred_test = base_model(test_x)
+    best_f1, map = f1_map(test_y, pred_test)
+    print(best_f1, map)
+    base_f1.append(best_f1)
+    base_mAP.append(mAP)
 
-plt.plot(np.arange(epochs + 1), f1s)
+plt.plot(np.arange(epochs + 1), f1s, label='inf net')
+plt.plot(np.arange(epochs + 1), base_f1, label='feature net')
+plt.legend()
 plt.xlabel('Epoch')
 plt.ylabel('F1')
-plt.title('F1 joint K=%d' % K)
+plt.title('F1 joint from scratch with BCE K=%d' % K)
 plt.show()
 plt.close()

@@ -1,5 +1,17 @@
 # Multi-Label Classification with Inference Structured Prediction Energy Net
 
+Under construction
+
+
+## Changelog
+
+- 20210527   
+     - Loaded the Tensorflow model's weights (copied.tar) into the pytorch model, https://medium.com/huggingface/from-tensorflow-to-pytorch-265f40ef2a28 
+     - The models of TF and PyTorch can give the same outputs.  see infnet-tf2pytorch.ipynb
+     - Training still is different.
+- 20210521 first trial
+     - Approximate Inference Network, failed.
+     - Improved joint training, it works under some unexpected cases.
 
 ## 
 
@@ -16,7 +28,6 @@ python 3.6
 pip install -r requirements.txt
 
 ## usage
-Currently just bibtex    /shared/xyang/bibtex  on vector2
 
 all hyper-parameters are written in code
 

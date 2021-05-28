@@ -6,3 +6,6 @@ scikit-learn==0.24.1
 scipy==1.5.4
 torch==1.0.1.post2
 visualdl==2.1.1
+
+# for reading the tf model
+tensorflow-gpu==1.15.0

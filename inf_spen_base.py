@@ -54,14 +54,13 @@ def tf2torch(checkpoint, feat_net, inf_net, energy_net):
     energy_net.c2.weight.data = torch.from_numpy(tf_vars[energy_i + 2][1].T)
     energy_net.linear_wt.weight.data = torch.from_numpy(tf_vars[energy_i + 3][1].T)
 
-
     inf_net.layer1.bias.data = torch.from_numpy(tf_vars[inf_i][1].T)
     inf_net.layer1.weight.data = torch.from_numpy(tf_vars[inf_i + 1][1].T)
     inf_net.layer2.bias.data = torch.from_numpy(tf_vars[inf_i + 2][1].T)
     inf_net.layer2.weight.data = torch.from_numpy(tf_vars[inf_i + 3][1].T)
     inf_net.layer3.weight.data = torch.from_numpy(tf_vars[inf_i + 4][1].T)
 
-    return feat_net, inf_net, energy_net
+    return feat_net.to(device), inf_net.to(device), energy_net.to(device)
 
 
 class MLP(nn.Module):
@@ -120,7 +119,7 @@ class InfNet(nn.Module):
         out = func.relu(self.layer1(x))
         out = func.relu(self.layer2(out))
         out = self.layer3(out)
-        return torch.sigmoid(out)
+        return torch.sigmoid(out), out
 
 
 class SPEN():
@@ -133,80 +132,87 @@ class SPEN():
         self.phi0 = InfNet().to(device)
         self.phi0.load_state_dict(inf_net.state_dict())
 
-    def _compute_energy(self, inputs, targets):
+    def compute_loss(self, inputs, targets):
         f_x = self.feature_extractor(inputs)
 
         # Energy ground truth
         gt_energy, _ = self.energy_net(f_x, targets)
 
         # Cost-augmented inference network
-        pred_probs = self.inf_net(inputs)
+        pred_probs, logits = self.inf_net(inputs)
 
         pred_energy, _ = self.energy_net(f_x, pred_probs)
 
-        return pred_probs, pred_energy, gt_energy
-
-    def compute_loss(self, inputs, targets):
-
-        pred_probs, pred_energy, gt_energy = self._compute_energy(inputs, targets)
         # Max-margin Loss
-        delta = torch.sum((pred_probs - targets)**2, dim=1)
-        pre_loss_real = delta - pred_energy + gt_energy
+        diff = torch.sum((pred_probs - targets)**2, dim=1)
+        gt_en = gt_energy
+        inf_en = pred_energy
+        pre_loss_real = diff  - inf_en + gt_en
+        # pre_loss_real = diff - inf_en + gt_en
+        # pre_loss_real = - inf_en + gt_en
 
         energy_loss = torch.relu(pre_loss_real)
         pre_loss_real = torch.mean(pre_loss_real)
         energy_loss = torch.mean(energy_loss)
 
-        entropy_loss = nn.BCELoss()(pred_probs, pred_probs.detach())
+        # entropy_loss = nn.BCELoss()(pred_probs, pred_probs.detach())
+        entropy_loss = func.binary_cross_entropy_with_logits(logits, pred_probs.detach())
 
         reg_losses_phi = 0.5 * sum(p.pow(2.0).sum() for p in self.inf_net.parameters())
-        pretrain_bias = sum((x - y).pow(2.0).sum() for x, y in zip(self.inf_net.state_dict().values(), self.phi0.state_dict().values()))
+
+        pretrain_bias = sum((x - y).pow(2.0).sum() for x, y in zip(list(self.inf_net.parameters()), self.phi0.state_dict().values()))
+
         reg_losses_theta = 0.5 * sum(p.pow(2.0).sum() for p in self.energy_net.parameters())
 
         inf_net_loss = energy_loss \
                        - 0.001 * reg_losses_phi \
-                       - 1 * pretrain_bias \
-                       - 1 * entropy_loss
+                       - 1 * pretrain_bias  #  \
+        # - 1 * entropy_loss
+
         inf_net_loss = -inf_net_loss
 
         e_net_loss = energy_loss + 0.001 * reg_losses_theta
 
         summaries = {
-            'base_objective': energy_loss.item(),
-            'base_obj_real': pre_loss_real.item(),
-            'energy_inf_net': pred_energy.mean().item(),
-            'energy_ground_truth': gt_energy.mean().item(),
-            'reg_losses_theta': reg_losses_theta.item(),
-            'reg_losses_phi': reg_losses_phi.item(),
-            'reg_losses_entropy': entropy_loss.item(),
-            'pretrain_bias': pretrain_bias.item()
+            'infer cost': inf_net_loss,
+            'energy cost': e_net_loss,
+            'base_objective': energy_loss,
+            'base_obj_real': pre_loss_real,
+            'energy_inf_net': pred_energy.mean(),
+            'energy_ground_truth': gt_energy.mean(),
+            'reg_losses_theta': reg_losses_theta,
+            'reg_losses_phi': reg_losses_phi,
+            'reg_losses_entropy': entropy_loss,
+            'pretrain_bias': pretrain_bias
         }
 
         return pred_probs, e_net_loss, inf_net_loss, summaries
 
     def pred(self, x):
         with torch.no_grad():
-            y_pred = self.inf_net(x)
+            y_pred, _ = self.inf_net(x)
         return y_pred
 
-    def inference(self, x, training=False, n_steps=1):
+    def inference_loss(self, x):
 
-        sd = self.inf_net.state_dict()
-        inf_net2 = MLP()
-        inf_net2.load_state_dict(sd)
-        self.inf_net.eval()
-        optimizer = optim.SGD(self.inf_net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-        with torch.no_grad():
-            y_pred = self.inf_net(x)
+        f_x = self.feature_extractor(x)
+        # inference network
+        pred_probs, logits = self.inf_net(x)
+        pred_energy, _ = self.energy_net(f_x, pred_probs)
 
-        self.inf_net.train()
+        entropy_loss = func.binary_cross_entropy_with_logits(logits, pred_probs.detach())
+        reg_losses_phi = 0.5 * sum(p.pow(2.0).sum() for p in self.inf_net.parameters())
 
-        return y_pred
+        inf_net_loss = torch.mean(pred_energy) \
+                       + 0.001 * reg_losses_phi \
+                       + 1 * entropy_loss
+
+        return inf_net_loss
 
 
 if __name__ == '__main__':
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 
     with open('data/bibtex/train.pickle', "rb") as f:
         temp = pickle.load(f)
@@ -230,82 +236,92 @@ if __name__ == '__main__':
     feat_net, inf_net, energy_net = tf2torch('./copied.ckpt', feat_net, inf_net, energy_net)
 
     optim_inf = torch.optim.Adam(inf_net.parameters(), lr=1e-3, weight_decay=0)
-    optim_energy = torch.optim.Adam(list(energy_net.C1.parameters()) + list(energy_net.c2.parameters()),
-                                    lr=1e-3, weight_decay=0)
+    optim_energy = torch.optim.Adam(list(energy_net.C1.parameters()) + list(energy_net.c2.parameters()), lr=1e-3, weight_decay=0)
+    optim_e = torch.optim.Adam(list(inf_net.parameters()) + list(energy_net.parameters()), lr=1e-3, weight_decay=0)
 
     spen = SPEN(feat_net, energy_net, inf_net)
-
-    with torch.no_grad():
-        feat = feat_net(test_x)
-        _, pred_test = energy_net(feat, test_y)
-
-    f1, _ = f1_map(test_y, pred_test)
-    print()
-    print('Start status:')
-    print('base feature net f1', f1)
     pred_test = spen.pred(test_x)
-    best_f1, _ = f1_map(test_y, pred_test)
-    print('inf net f1', best_f1)
+    best_f1, mAP = f1_map(test_y, pred_test)
+    print('inf net start', best_f1, mAP)
 
-    print('training starts:')
-    debug = True
-    epochs = 2 if debug else 100
-    for epoch in range(epochs):
-        for i in range(0, 4880, 32):
-            if i + 32 > 4880:
+    phi_energies = []
+    theta_energies = []
+    f1s = [best_f1]
+    for epoch in range(50):
+
+        for j, i in enumerate(range(0, 4880, 32)):
+            if i+32 > 4880:
                 i = 0
-            l = np.arange(i, i + 32)
+            l = np.arange(i, i+32)
             data = data_x[l]
+            # print(data.sum())
             label = data_y[l]
 
+            optim_e.zero_grad()
             optim_inf.zero_grad()
-            preds, e_loss, inf_loss, summaries = spen.compute_loss(data, label)
-
-            if debug:
-                summary = {}
-                summary['cost_phi'] = inf_loss.item()
-                summary['cost_theta'] = e_loss.item()
-                summary.update(summaries)
-                print('before')
-                print(summary)
+            preds, e_loss, inf_loss, summary = spen.compute_loss(data, label)
 
             inf_loss.backward()
-            optim_inf.step()
-            optim_energy.zero_grad()
 
-            preds, e_loss, inf_loss, summaries = spen.compute_loss(data, label)
-            if debug:
-                summary = {}
-                summary['cost_phi'] = inf_loss.item()
-                summary['cost_theta'] = e_loss.item()
-                summary.update(summaries)
-                print('update phi')
-                print(summary)
+            optim_inf.step()
+
+
+            optim_e.zero_grad()
+            optim_inf.zero_grad()
+            preds, e_loss, inf_loss, summary = spen.compute_loss(data, label)
 
             e_loss.backward()
+
             optim_energy.step()
 
-            preds, e_loss, inf_loss, summaries = spen.compute_loss(data, label)
-            if debug:
-                summary = {}
-                summary['cost_phi'] = inf_loss.item()
-                summary['cost_theta'] = e_loss.item()
-                summary.update(summaries)
-                print('update theta')
-                print(summary)
         print(epoch)
 
         pred_test = spen.pred(test_x)
         best_f1, mAP = f1_map(test_y, pred_test)
-        print('inf net', best_f1, mAP)
+        print('current inf net', best_f1, mAP)
 
-        # pred_test = spen.inference(test_x)
-        # best_f1, mAP = f1_map(test_y, pred_test)
-        # print(best_f1, mAP)
         with torch.no_grad():
             feat = feat_net(test_x)
             _, pred_test = energy_net(feat, test_y)
 
-        f1, mAP = f1_map(test_y, pred_test)
+        f1, mAP = f1_map(test_y, pred_test, 0.5)
+        print('feature net', f1, mAP)
+        print()
+
+    optimizer = torch.optim.Adam(spen.inf_net.parameters(), lr=0.00001, weight_decay=0)
+    pred_test = spen.pred(test_x)
+    best_f1, mAP = f1_map(test_y, pred_test)
+    print('inf net start', best_f1, mAP)
+
+    phi_energies = []
+    theta_energies = []
+    f1s = [best_f1]
+    for epoch in range(10):
+
+        for j, i in enumerate(range(0, 4880, 32)):
+            if i+32 > 4880:
+                i = 0
+            l = np.arange(i, i+32)
+            data = data_x[l]
+            label = data_y[l]
+
+            optimizer.zero_grad()
+            inf_loss = spen.inference_loss(data)
+
+            inf_loss.backward()
+
+            optimizer.step()
+
+        print(epoch)
+
+        pred_test = spen.pred(test_x)
+        best_f1, mAP = f1_map(test_y, pred_test)
+        print('current inf net', best_f1, mAP)
+
+        with torch.no_grad():
+            feat = feat_net(test_x)
+            _, pred_test = energy_net(feat, test_y)
+
+        f1, mAP = f1_map(test_y, pred_test, 0.5)
         print('feature net', f1, mAP)
         print()

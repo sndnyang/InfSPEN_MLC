@@ -5,6 +5,8 @@ Under construction
 
 ## Changelog
 
+- 20210621  
+     - Successfully implemented inf spen in PyTorch, 
 - 20210527   
      - Loaded the Tensorflow model's weights (copied.tar) into the pytorch model, https://medium.com/huggingface/from-tensorflow-to-pytorch-265f40ef2a28 
      - The models of TF and PyTorch can give the same outputs.  see infnet-tf2pytorch.ipynb
@@ -31,11 +33,33 @@ pip install -r requirements.txt
 
 all hyper-parameters are written in code
 
-Original one:
+Pretrain feature network from Tensorflow:
 
-python inf-spe.py
+```shell script
+python inf_spen_base.py
+```
 
-Joint Inf SPEN:
+|                  | F1(0.5) | F1(threshold) | mAP    |
+|------------------|---------|---------------|--------|
+| MLP              | 0.3787  | 0.4106        | 0.3305 |
+| Cost-aug Inf Net |         | 0.4095        | 0.3276 |
+| Inf Net          |         | 0.4200        | 0.3268 |
+
+
+All pytorch:
+
+```shell script
+python inf_spen.py
+```
+
+|                  | F1(0.5) | F1(threshold) | mAP    |
+|------------------|---------|---------------|--------|
+| MLP              | 0.3336  | 0.3938        | 0.3060 |
+| Cost-aug Inf Net |         | 0.3825        | 0.3042 |
+| Inf Net          |         | 0.3930        | 0.3064 |
+
+
+Joint Inf SPEN(can't work):
 
 python jispen.py
 
